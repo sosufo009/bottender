@@ -148,6 +148,143 @@ export default class Bot<B extends Body, C extends Client, E extends Event> {
     }
   }
 
+  async run(body: B, requestContext?: Record<string, any> | null) {
+    await this.initSessionStore();
+
+    const { platform } = this._connector;
+    const sessionKey = this._connector.getUniqueSessionKey(
+      body,
+      requestContext
+    );
+
+    // Create or retrieve session if possible
+    let sessionId: string | undefined;
+    let session: Session | undefined;
+    if (sessionKey) {
+      sessionId = `${platform}:${sessionKey}`;
+
+      session =
+        (await this._sessions.read(sessionId)) ||
+        (Object.create(null) as Session);
+
+      debugSessionRead(`Read session: ${sessionId}`);
+      debugSessionRead(JSON.stringify(session, null, 2));
+
+      Object.defineProperty(session, 'id', {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: session.id || sessionId,
+      });
+
+      if (!session.platform) session.platform = platform;
+
+      Object.defineProperty(session, 'platform', {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: session.platform,
+      });
+
+      await this._connector.updateSession(session, body);
+    }
+
+    const events = this._connector.mapRequestToEvents(body);
+
+    const contexts = await pMap(
+      events,
+      event =>
+        this._connector.createContext({
+          event,
+          session,
+          initialState: this._initialState,
+          requestContext,
+          emitter: this._emitter,
+        }),
+      {
+        concurrency: 5,
+      }
+    );
+
+    // Call all of extension functions before passing to handler.
+    contexts.forEach(context => {
+      this._plugins.forEach(ext => {
+        ext(context);
+      });
+    });
+
+    if (this._handler == null) {
+      throw new Error(
+        'Bot: Missing event handler function. You should assign it using onEvent(...)'
+      );
+    }
+    const handler: Action<C, E> = this._handler;
+    const errorHandler: Action<C, E> | null = this._errorHandler;
+    const promises = Promise.all(
+      contexts.map(context =>
+        Promise.resolve()
+          .then(() => run(handler)(context))
+          .then(() => {
+            if (context.handlerDidEnd) {
+              return context.handlerDidEnd();
+            }
+          })
+          .catch(err => {
+            if (errorHandler) {
+              return run(errorHandler)(context, { error: err });
+            }
+            throw err;
+          })
+          .catch(err => {
+            context.emitError(err);
+            throw err;
+          })
+      )
+    );
+
+    if (this._sync) {
+      try {
+        await promises;
+        if (sessionId && session) {
+          session.lastActivity = Date.now();
+          contexts.forEach(context => {
+            context.isSessionWritten = true;
+          });
+
+          debugSessionWrite(`Write session: ${sessionId}`);
+          debugSessionWrite(JSON.stringify(session, null, 2));
+
+          await this._sessions.write(sessionId, session);
+        }
+      } catch (err) {
+        console.error(err);
+      }
+
+      // TODO: Any chances to merge multiple responses from context?
+      const response = contexts[0].response;
+      if (response && typeof response === 'object') {
+        debugResponse('Outgoing response:');
+        debugResponse(JSON.stringify(response, null, 2));
+      }
+      return response;
+    }
+    promises
+      .then((): Promise<any> | void => {
+        if (sessionId && session) {
+          session.lastActivity = Date.now();
+          contexts.forEach(context => {
+            context.isSessionWritten = true;
+          });
+
+          debugSessionWrite(`Write session: ${sessionId}`);
+          debugSessionWrite(JSON.stringify(session, null, 2));
+
+          return this._sessions.write(sessionId, session);
+        }
+      })
+      .catch(console.error);
+  }
+
   createRequestHandler(): RequestHandler<B> {
     if (this._handler == null) {
       throw new Error(
@@ -170,140 +307,9 @@ export default class Bot<B extends Body, C extends Client, E extends Event> {
       debugRequest('Incoming request body:');
       debugRequest(JSON.stringify(body, null, 2));
 
-      await this.initSessionStore();
-
-      const { platform } = this._connector;
-      const sessionKey = this._connector.getUniqueSessionKey(
-        body,
-        requestContext
-      );
-
-      // Create or retrieve session if possible
-      let sessionId: string | undefined;
-      let session: Session | undefined;
-      if (sessionKey) {
-        sessionId = `${platform}:${sessionKey}`;
-
-        session =
-          (await this._sessions.read(sessionId)) ||
-          (Object.create(null) as Session);
-
-        debugSessionRead(`Read session: ${sessionId}`);
-        debugSessionRead(JSON.stringify(session, null, 2));
-
-        Object.defineProperty(session, 'id', {
-          configurable: false,
-          enumerable: true,
-          writable: false,
-          value: session.id || sessionId,
-        });
-
-        if (!session.platform) session.platform = platform;
-
-        Object.defineProperty(session, 'platform', {
-          configurable: false,
-          enumerable: true,
-          writable: false,
-          value: session.platform,
-        });
-
-        await this._connector.updateSession(session, body);
-      }
-
-      const events = this._connector.mapRequestToEvents(body);
-
-      const contexts = await pMap(
-        events,
-        event =>
-          this._connector.createContext({
-            event,
-            session,
-            initialState: this._initialState,
-            requestContext,
-            emitter: this._emitter,
-          }),
-        {
-          concurrency: 5,
-        }
-      );
-
-      // Call all of extension functions before passing to handler.
-      contexts.forEach(context => {
-        this._plugins.forEach(ext => {
-          ext(context);
-        });
-      });
-
-      if (this._handler == null) {
-        throw new Error(
-          'Bot: Missing event handler function. You should assign it using onEvent(...)'
-        );
-      }
-      const handler: Action<C, E> = this._handler;
-      const errorHandler: Action<C, E> | null = this._errorHandler;
-      const promises = Promise.all(
-        contexts.map(context =>
-          Promise.resolve()
-            .then(() => run(handler)(context))
-            .then(() => {
-              if (context.handlerDidEnd) {
-                return context.handlerDidEnd();
-              }
-            })
-            .catch(err => {
-              if (errorHandler) {
-                return run(errorHandler)(context, { error: err });
-              }
-              throw err;
-            })
-            .catch(err => {
-              context.emitError(err);
-              throw err;
-            })
-        )
-      );
-
-      if (this._sync) {
-        try {
-          await promises;
-          if (sessionId && session) {
-            session.lastActivity = Date.now();
-            contexts.forEach(context => {
-              context.isSessionWritten = true;
-            });
-
-            debugSessionWrite(`Write session: ${sessionId}`);
-            debugSessionWrite(JSON.stringify(session, null, 2));
-
-            await this._sessions.write(sessionId, session);
-          }
-        } catch (err) {
-          console.error(err);
-        }
-
-        // TODO: Any chances to merge multiple responses from context?
-        const response = contexts[0].response;
-        if (response && typeof response === 'object') {
-          debugResponse('Outgoing response:');
-          debugResponse(JSON.stringify(response, null, 2));
-        }
-        return response;
-      }
-      promises
-        .then((): Promise<any> | void => {
-          if (sessionId && session) {
-            session.lastActivity = Date.now();
-            contexts.forEach(context => {
-              context.isSessionWritten = true;
-            });
-
-            debugSessionWrite(`Write session: ${sessionId}`);
-            debugSessionWrite(JSON.stringify(session, null, 2));
-
-            return this._sessions.write(sessionId, session);
-          }
-        })
-        .catch(console.error);
+      // send into queue
+      // create a runner and listen to queue
+      await this.run(body, requestContext);
     };
   }
 }
