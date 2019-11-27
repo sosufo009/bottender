@@ -132,6 +132,11 @@ export default class SlackConnector
       return rawEvent.channel_id;
     }
 
+    // For slack modal
+    if (rawEvent.view && rawEvent.view.private_metadata) {
+      return JSON.parse(rawEvent.view.private_metadata).channelId;
+    }
+
     // For reaction_added format
     if (
       rawEvent.item &&
@@ -151,7 +156,12 @@ export default class SlackConnector
 
     const rawEvent = this._getRawEventFromRequest(body);
     let userFromBody;
-    if (rawEvent.type === 'interactive_message') {
+    if (
+      rawEvent.type === 'interactive_message' ||
+      rawEvent.type === 'block_actions' ||
+      rawEvent.type === 'view_submission' ||
+      rawEvent.type === 'view_closed')
+    ) {
       userFromBody = rawEvent.user.id;
     } else {
       userFromBody = (rawEvent as Message).user;

@@ -95,6 +95,27 @@ export default class SlackContext extends Context<SlackOAuthClient, SlackEvent>
   }
 
   /**
+   * Sends a message to the channel of the session.
+   *
+   * https://api.slack.com/methods/chat.postMessage
+   */
+  openView(
+    view: {},
+    triggerId: string
+  ): Promise<any> {
+    return this._client.callMethod('views.open', {
+      view: JSON.stringify({
+        ...view,
+        private_metadata: JSON.stringify({
+          ...(view.private_metadata || {}),
+          channelId: this.event.rawEvent.channel.id,
+        }),
+      }),
+      trigger_id: triggerId,
+    });
+  }
+
+  /**
    * Send text to the owner of the session.
    *
    */
